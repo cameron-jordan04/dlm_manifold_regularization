@@ -15,6 +15,9 @@ import random
 import operator
 from typing import Tuple, List, Dict
 
+import os
+from tqdm import tqdm
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -545,9 +548,6 @@ def measure_lipschitz_continuity(
     return variance
 
 if __name__ == "__main__":
-    import os
-    from tqdm import tqdm
-
     def main():
         # 1. Configuration & Hyperparameters
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -556,13 +556,12 @@ if __name__ == "__main__":
         num_samples = 10000
         batch_size = 128
         seq_len = 16
-        mdlm_epochs = 5
+        mdlm_epochs = 16
         mlp_epochs = 3
         learning_rate = 5e-4
-        lambda_iso = 0.5
         d_max = 10.0  # Assumed max L2 distance in the latent space
 
-        # 2. Initialization
+        # 2. Shared Initialization
         dataset = ArithmeticDataset(num_samples=num_samples, seq_len=seq_len)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 
@@ -571,60 +570,6 @@ if __name__ == "__main__":
         mask_id = dataset.mask_id
         num_timesteps = 50
 
-        model = MicroMDLM(vocab_size=vocab_size, num_timesteps=num_timesteps).to(device)
-        diffusion = MaskedDiffusionProcess(num_timesteps=num_timesteps, vocab_size=vocab_size, mask_token_id=mask_id)
-        value_model = ValueTwistMLP(d_model=128).to(device)
-
-        optimizer_mdlm = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-        optimizer_mlp = torch.optim.AdamW(value_model.parameters(), lr=learning_rate)
-
-        # 3. Phase 1: Train MicroMDLM (Base + Manifold Regularization)
-        print("\n--- Phase 1: Training MicroMDLM ---")
-        model.train()
-        
-        for epoch in range(mdlm_epochs):
-            total_epoch_loss = 0.0
-            
-            # Initialize tqdm progress bar for the epoch
-            pbar = tqdm(dataloader, desc=f"MDLM Epoch {epoch+1}/{mdlm_epochs}")
-            
-            for batch in pbar:
-                batch = batch.to(device)
-                optimizer_mdlm.zero_grad()
-
-                # Generate regularized pairs and their ground truth edit distances
-                x_a, x_b, d_edit = sample_sequence_pairs(
-                    batch, vocab_size, min_mutations=1, max_mutations=4, pad_id=pad_id
-                )
-
-                # Forward pass and loss computation
-                loss, metrics = compute_total_loss(
-                    model, diffusion, x_a, x_b, d_edit, lambda_iso, d_max, pad_id
-                )
-
-                loss.backward()
-                # Gradient clipping to stabilize Transformer training
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer_mdlm.step()
-
-                total_epoch_loss += loss.item()
-                
-                # Update progress bar with the current losses
-                pbar.set_postfix({
-                    "Loss": f"{metrics['total_loss']:.3f}", 
-                    "MDLM": f"{metrics['loss_mdlm']:.3f}", 
-                    "Iso": f"{metrics['loss_iso']:.3f}"
-                })
-
-        # Freeze MDLM weights for Phase 2
-        model.eval()
-        for param in model.parameters():
-            param.requires_grad = False
-
-        # 4. Phase 2: Train ValueTwistMLP on frozen latents
-        print("\n--- Phase 2: Training ValueTwistMLP (Parity Prediction) ---")
-        value_model.train()
-        
         # Helper to extract the ground truth parity (is_even) from the dataset strings
         def get_parity_labels(x_batch):
             labels = []
@@ -638,62 +583,144 @@ if __name__ == "__main__":
                     labels.append(0.0) # Fallback for any malformed sequences
             return torch.tensor(labels, dtype=torch.float32, device=device)
 
-        t_zero = torch.zeros(batch_size, dtype=torch.long, device=device)
-
-        for epoch in range(mlp_epochs):
-            pbar = tqdm(dataloader, desc=f"MLP Epoch {epoch+1}/{mlp_epochs}")
-            
-            for batch in pbar:
-                batch = batch.to(device)
-                labels = get_parity_labels(batch)
-                
-                optimizer_mlp.zero_grad()
-
-                # Extract frozen continuous latents from the base model
-                with torch.no_grad():
-                    _, z = model(batch, t_zero)
-
-                # Predict parity
-                preds = value_model(z).squeeze(-1)
-                
-                loss = F.binary_cross_entropy(preds, labels)
-                loss.backward()
-                optimizer_mlp.step()
-
-                pbar.set_postfix({"BCE Loss": f"{loss.item():.4f}"})
-
-        # 5. Phase 3: Evaluation
-        print("\n--- Phase 3: Evaluation ---")
-        
-        # Measure Lipschitz continuity of the trained manifold
-        print("Measuring Lipschitz continuity (calculating gradient variance)...")
-        variance = measure_lipschitz_continuity(model, value_model, dataloader)
-        print(f"Gradient Variance (Lower is smoother): {variance:.6f}")
-
-        # Test latent interpolation on a single pair
-        print("\nRunning Latent Interpolation Test...")
+        # Extract a fixed test pair so both models interpolate the exact same equations
         test_batch = next(iter(dataloader)).to(device)
-        x_a = test_batch[0:1]
-        x_b = test_batch[1:2]
-        
-        alphas = [0.0, 0.25, 0.5, 0.75, 1.0]
-        interpolated_seqs = evaluate_latent_interpolation(model, x_a, x_b, alphas)
-        
-        print(f"Sequence A (alpha=0.0): {dataset.decode(x_a[0])}")
-        for i, alpha in enumerate(alphas):
-            decoded = dataset.decode(interpolated_seqs[i][0])
-            print(f"  Alpha {alpha:.2f} -> {decoded}")
-        print(f"Sequence B (alpha=1.0): {dataset.decode(x_b[0])}")
+        fixed_x_a = test_batch[0:1]
+        fixed_x_b = test_batch[1:2]
 
-        # 6. Save Final Models
-        print("\n--- Saving Models ---")
+        # Define the two experiment configurations
+        experiments = [
+            {"name": "Baseline", "lambda_iso": 0.0, "prefix": "baseline"},
+            {"name": "Regularized", "lambda_iso": 1, "prefix": "regularized"}
+        ]
+
+        results = {}
         os.makedirs("checkpoints", exist_ok=True)
-        mdlm_path = os.path.join("checkpoints", "mdlm_final.pt")
-        mlp_path = os.path.join("checkpoints", "value_mlp_final.pt")
-        
-        torch.save(model.state_dict(), mdlm_path)
-        torch.save(value_model.state_dict(), mlp_path)
-        print(f"Models saved to {mdlm_path} and {mlp_path}")
 
-    # Execute the main function
+        # 3. Main Experiment Loop
+        for exp in experiments:
+            exp_name = exp["name"]
+            l_iso = exp["lambda_iso"]
+            prefix = exp["prefix"]
+
+            print(f"\n{'='*60}")
+            print(f" EXPERIMENT: {exp_name} (lambda_iso = {l_iso})")
+            print(f"{'='*60}")
+
+            # Initialize fresh models for this run
+            model = MicroMDLM(vocab_size=vocab_size, num_timesteps=num_timesteps).to(device)
+            diffusion = MaskedDiffusionProcess(num_timesteps=num_timesteps, 
+                                               vocab_size=vocab_size, mask_token_id=mask_id)
+            value_model = ValueTwistMLP(d_model=128).to(device)
+
+            optimizer_mdlm = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+            optimizer_mlp = torch.optim.AdamW(value_model.parameters(), lr=learning_rate)
+
+            # --- Phase 1: Train MicroMDLM ---
+            print(f"\n--- Phase 1: Training {exp_name} MicroMDLM ---")
+            model.train()
+
+            for epoch in range(mdlm_epochs):
+                pbar = tqdm(dataloader, desc=f"MDLM Epoch {epoch+1}/{mdlm_epochs}")
+
+                for batch in pbar:
+                    batch = batch.to(device)
+                    optimizer_mdlm.zero_grad()
+
+                    x_a, x_b, d_edit = sample_sequence_pairs(
+                        batch, vocab_size, min_mutations=1, max_mutations=4, pad_id=pad_id
+                    )
+
+                    loss, metrics = compute_total_loss(
+                        model, diffusion, x_a, x_b, d_edit, l_iso, d_max, pad_id
+                    )
+
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer_mdlm.step()
+
+                    pbar.set_postfix({
+                        "Loss": f"{metrics['total_loss']:.3f}", 
+                        "MDLM": f"{metrics['loss_mdlm']:.3f}", 
+                        "Iso": f"{metrics['loss_iso']:.3f}"
+                    })
+
+            # Freeze MDLM weights for Phase 2
+            model.eval()
+            for param in model.parameters():
+                param.requires_grad = False
+
+            # --- Phase 2: Train ValueTwistMLP on frozen latents ---
+            print(f"\n--- Phase 2: Training {exp_name} ValueTwistMLP Probe ---")
+            value_model.train()
+            t_zero = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+            for epoch in range(mlp_epochs):
+                pbar = tqdm(dataloader, desc=f"MLP Epoch {epoch+1}/{mlp_epochs}")
+
+                for batch in pbar:
+                    batch = batch.to(device)
+                    labels = get_parity_labels(batch)
+
+                    optimizer_mlp.zero_grad()
+
+                    with torch.no_grad():
+                        _, z = model(batch, t_zero)
+
+                    preds = value_model(z).squeeze(-1)
+
+                    loss = F.binary_cross_entropy(preds, labels)
+                    loss.backward()
+                    optimizer_mlp.step()
+
+                    pbar.set_postfix({"BCE Loss": f"{loss.item():.4f}"})
+
+            # --- Phase 3: Evaluation & Saving ---
+            print(f"\n--- Phase 3: Evaluating {exp_name} ---")
+
+            variance = measure_lipschitz_continuity(model, value_model, dataloader)
+            print(f"Gradient Variance: {variance:.6f}")
+
+            alphas = [0.0, 0.25, 0.5, 0.75, 1.0]
+            interpolated_seqs = evaluate_latent_interpolation(model, fixed_x_a, fixed_x_b, alphas)
+
+            # Store results for final comparison
+            results[exp_name] = {
+                "variance": variance,
+                "interpolations": [dataset.decode(seq[0]) for seq in interpolated_seqs]
+            }
+
+            # Save Models
+            mdlm_path = os.path.join("checkpoints", f"mdlm_{prefix}.pt")
+            mlp_path = os.path.join("checkpoints", f"value_mlp_{prefix}.pt")
+            torch.save(model.state_dict(), mdlm_path)
+            torch.save(value_model.state_dict(), mlp_path)
+            print(f"Saved {exp_name} models to checkpoints/")
+
+        # 4. Final Comparative Output
+        print("\n\n" + "="*60)
+        print(" FINAL COMPARISON REPORT")
+        print("="*60)
+
+        print("\n1. Lipschitz Continuity (Gradient Variance)")
+        print("-" * 40)
+        print(f"Baseline (λ=0.0):    {results['Baseline']['variance']:.6f}")
+        print(f"Regularized (λ=0.5): {results['Regularized']['variance']:.6f}")
+        print("* Note: Lower variance indicates a smoother, more continuous latent manifold.\n")
+
+        print("2. Latent Interpolation Comparison")
+        print("-" * 40)
+        print(f"Sequence A (\\alpha=0.0): {dataset.decode(fixed_x_a[0])}")
+        print(f"Sequence B (\\alpha=1.0): {dataset.decode(fixed_x_b[0])}\n")
+
+        alphas = [0.0, 0.25, 0.5, 0.75, 1.0]
+        print(f"{'Alpha':<10} | {'Baseline Path':<20} | {'Regularized Path':<20}")
+        print("-" * 55)
+        for i, alpha in enumerate(alphas):
+            base_str = results['Baseline']['interpolations'][i]
+            reg_str = results['Regularized']['interpolations'][i]
+            print(f"{alpha:<10.2f} | {base_str:<20} | {reg_str:<20}")
+        print("\nExecution Complete.")
+
+    # Execute the script
     main()
