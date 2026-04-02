@@ -654,7 +654,7 @@ if __name__ == "__main__":
         seq_len = 16
         mdlm_epochs = 16
         mlp_epochs = 4
-        learning_rate = 5e-4
+        learning_rate = 2e-3
         generation_samples = 64 # Number of sequences to generate for evaluation
 
         # Shared Initialization
@@ -703,6 +703,10 @@ if __name__ == "__main__":
             value_model = ValueTwistMLP(d_model=128).to(device)
 
             optimizer_mdlm = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer_mdlm, T_max=mdlm_epochs * len(dataloader)
+            )
+
             optimizer_mlp = torch.optim.AdamW(value_model.parameters(), lr=learning_rate)
 
             # --- Pre-Training Inference (Untrained Check) ---
@@ -733,8 +737,9 @@ if __name__ == "__main__":
                     )
 
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 2.5)
                     optimizer_mdlm.step()
+                    scheduler.step()
 
                     pbar.set_postfix({
                         "Loss": f"{metrics['total_loss']:.3f}", 
