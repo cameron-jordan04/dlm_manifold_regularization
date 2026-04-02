@@ -299,7 +299,7 @@ class MaskedDiffusionProcess:
 
         self.register_buffer = None
         steps = torch.arange(num_timesteps + 1, dtype=torch.float32)
-        f = torch.cos(((steps / num_timesteps) + 0.008) / 1.008 * torch.pi / 2) ** 2
+        f = torch.cos(((steps / num_timesteps) + 0.1) / 1.1 * torch.pi / 2) ** 2
         alpha_bar_full = f / f[0]
         self.alpha_single = (alpha_bar_full[1:] / alpha_bar_full[:-1]).clamp(min=1e-8)
         self.alpha_bar = alpha_bar_full[1:]
