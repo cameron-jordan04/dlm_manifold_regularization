@@ -740,7 +740,7 @@ if __name__ == "__main__":
             model.train()
 
             ## TEST
-            overfit_optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+            overfit_optimizer = torch.optim.AdamW(model.parameters(), lr=5e-3)
             overfit_batch = next(iter(dataloader)).to(device)
             for step in range(200):
                 x_a, x_b, d_edit = sample_sequence_pairs(overfit_batch, vocab_size, pad_id=pad_id)
