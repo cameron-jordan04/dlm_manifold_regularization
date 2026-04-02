@@ -97,7 +97,7 @@ class ArithmeticDataset(Dataset):
         # Convert strings to padded integer tensors
         tensor_data = torch.full((self.num_samples, self.seq_len), self.pad_id, dtype=torch.long)
 
-        for i, eq in enumerate(unique_equations):
+        for i, eq in enumerate(sorted(unique_equations)):
             tokenized = [self.char2id[char] for char in eq]
             tensor_data[i, :len(tokenized)] = torch.tensor(tokenized, dtype=torch.long)
 
@@ -236,7 +236,7 @@ class MicroMDLM(nn.Module):
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
         # Unembedding projection to vocabulary logits
-        self.unbedding = nn.Linear(d_model, vocab_size)
+        self.unembedding = nn.Linear(d_model, vocab_size)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -261,7 +261,7 @@ class MicroMDLM(nn.Module):
         latents = self.transformer(emb)
 
         # 5. Project to discrete vocabulary space, shape: [B, L, V]
-        logits = self.unbedding(latents)
+        logits = self.unembedding(latents)
 
         return logits, latents
 
@@ -275,16 +275,13 @@ class MaskedDiffusionProcess:
         self.vocab_size = vocab_size
         self.mask_token_id = mask_token_id
 
-        # Define the masking schedule
-        self.beta = torch.linspace(1e-4, 0.05, num_timesteps)
+        self.register_buffer = None
+        beta = torch.linspace(1e-4, 0.05, num_timesteps)
+        alpha = 1.0 - beta
+        self.alpha_bar = torch.cumprod(alpha, dim=0)
+        self.alpha_single = alpha
 
-        # alpha_t is the probability of surviving a single timestep without being masked
-        self.alpha = 1.0 - self.beta
-
-        # alpha_bar_t is the cumulative probability of surviving from t=0 to t
-        self.alpha_bar = torch.cumprod(self.alpha, dim=0)
-
-    def q_sample(self, x_0: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def q_sample(self, x_0: torch.Tensor, t: torch.Tensor, pad_id: int = 0) -> torch.Tensor:
         """
         Forward process: Adds noise to x_0 to get x_t using absorbing state logic.
         Args:
@@ -298,8 +295,8 @@ class MaskedDiffusionProcess:
 
         # 1. Fetch the survival probabilities for the given timesteps
         # Move alpha_bar to the correct device and extract the batched probabilities
-        self.alpha_bar = self.alpha_bar.to(device)
-        survival_probs = self.alpha_bar[t] # Shape: [B]
+        alpha_bar = self.alpha_bar.to(device)
+        survival_probs = alpha_bar[t]
 
         # 2. Reshape for broadcasting across the sequence length
         survival_probs = survival_probs.unsqueeze(1).expand(batch_size, seq_len) # Shape: [B, L]
@@ -310,7 +307,7 @@ class MaskedDiffusionProcess:
         # 4. Create the mask: True if the token survives, False if it gets masked
         # Note: In practice, you should never mask padding tokens. Assuming pad_id=0.
         keep_mask = random_matrix < survival_probs
-        pad_mask = x_0 == 0
+        pad_mask = x_0 == pad_id
         final_keep_mask = keep_mask | pad_mask
 
         # 5. Apply the mask to generate x_t
@@ -318,6 +315,62 @@ class MaskedDiffusionProcess:
 
         return x_t
 
+@torch.no_grad()
+def generate_sequences(
+    model: 'MicroMDLM', 
+    diffusion: 'MaskedDiffusionProcess', 
+    num_samples: int, 
+    seq_len: int, 
+    device: torch.device, 
+    temperature: float = 1.0
+) -> torch.Tensor:
+    """
+    Executes the reverse diffusion process to generate novel sequences from scratch.
+    Starting from pure noise (all [MASK] tokens), it iteratively unmasks tokens.
+    """
+    model.eval()
+    
+    # Start with a batch of completely masked sequences
+    x = torch.full((num_samples, seq_len), diffusion.mask_token_id, dtype=torch.long, device=device)
+    
+    # Ensure alpha_bar is on the correct device
+    alpha_bar = diffusion.alpha_bar.to(device)
+    
+    # Reverse diffusion loop
+    for t_val in tqdm(reversed(range(diffusion.num_timesteps)), desc="Reverse Diffusion", leave=False):
+        t = torch.full((num_samples,), t_val, dtype=torch.long, device=device)
+        
+        # Predict the original clean tokens x_0
+        logits, _ = model(x, t)
+        
+        # Identify which tokens are still masked
+        is_masked = (x == diffusion.mask_token_id)
+        
+        if t_val == 0:
+            # At the final step, simply sample the remaining masked tokens
+            logits[..., diffusion.mask_token_id] = -float('inf')
+            probs = F.softmax(logits / temperature, dim=-1)
+            sampled = torch.multinomial(probs.view(-1, diffusion.vocab_size), 1).view(num_samples, seq_len)
+            x = torch.where(is_masked, sampled, x)
+        else:
+            # Suppress [MASK] token from being sampled as a prediction
+            logits[..., diffusion.mask_token_id] = -float('inf')
+            probs = F.softmax(logits / temperature, dim=-1)
+            sampled_x0 = torch.multinomial(probs.view(-1, diffusion.vocab_size), 1).view(num_samples, seq_len)
+
+            alpha_bar_t = alpha_bar[t_val]
+            alpha_bar_t_minus_1 = alpha_bar[t_val - 1]
+            # Use single-step alpha for correct MDLM posterior; clamp denominator against div-by-zero
+            alpha_t = diffusion.alpha_single.to(device)[t_val]
+            denom = (1.0 - alpha_bar_t).clamp(min=1e-8)
+            prob_remain_masked = ((1.0 - alpha_bar_t_minus_1) * (1.0 - alpha_t) / denom).clamp(0.0, 1.0)
+
+            random_matrix = torch.rand((num_samples, seq_len), device=device)
+            keep_mask = random_matrix < prob_remain_masked
+            new_unmasked = is_masked & (~keep_mask)
+            x = torch.where(new_unmasked, sampled_x0, x)
+            
+    return x
 
 # =============================================================================
 # Part 3: The Dual-Objective Loss Function
@@ -341,8 +394,7 @@ def compute_mdlm_loss(logits: torch.Tensor, targets: torch.Tensor,
 
     return F.cross_entropy(logits_masked, targets_masked)
 
-def compute_isometric_loss(z_t_a: torch.Tensor, z_t_b: torch.Tensor, d_edit: torch.Tensor,
-                           d_max: float) -> torch.Tensor:
+def compute_isometric_loss(z_t_a: torch.Tensor, z_t_b: torch.Tensor, d_edit: torch.Tensor) -> torch.Tensor:
     """
     Computes the manifold penalty:
     $$L_{\\text{isometric}} 
@@ -360,7 +412,7 @@ def compute_isometric_loss(z_t_a: torch.Tensor, z_t_b: torch.Tensor, d_edit: tor
     l2_distances = torch.sqrt(torch.sum(diff_squared, dim=1))
 
     # Normalize the L2 distance
-    normalized_l2 = l2_distances / d_max
+    normalized_l2 = l2_distances / (l2_distances.detach().max().clamp(min=1e-8))
 
     # Compute the squared error between the normalized latent distance
     # and ground truth edit distance
@@ -389,8 +441,8 @@ def compute_total_loss(
     t = torch.randint(0, diffusion.num_timesteps, (batch_size,), device=device)
 
     # 2. Apply forward diffusion
-    x_t_a = diffusion.q_sample(x_a, t)
-    x_t_b = diffusion.q_sample(x_b, t)
+    x_t_a = diffusion.q_sample(x_a, t, pad_id=pad_id)
+    x_t_b = diffusion.q_sample(x_b, t, pad_id=pad_id)
 
     # 3. Forward pass through the model
     logits_a, z_t_a = model(x_t_a, t)
@@ -407,7 +459,7 @@ def compute_total_loss(
     loss_mdlm = (loss_mdlm_a + loss_mdlm_b) / 2.0
 
     # 6. Compute Manifold Penalty
-    loss_iso = compute_isometric_loss(z_t_a, z_t_b, d_edit, d_max)
+    loss_iso = compute_isometric_loss(z_t_a, z_t_b, d_edit)
 
     # 7. Compute Total Regularized Loss
     total_loss = loss_mdlm + (lambda_iso * loss_iso)
@@ -454,7 +506,7 @@ def evaluate_latent_interpolation(
         z_interp = alpha * z_a + (1.0 - alpha) * z_b
 
         # Project continuous latents back to discrete vocabulary logits
-        logits_interp = model.unbedding(z_interp)
+        logits_interp = model.unembedding(z_interp)
 
         # Get discrete tokens via argmax
         tokens_interp = torch.argmax(logits_interp, dim=-1)
@@ -547,21 +599,67 @@ def measure_lipschitz_continuity(
     variance = torch.var(all_grad_norms).item()
     return variance
 
+def evaluate_equation_validity(sequences: torch.Tensor, dataset: ArithmeticDataset) -> dict:
+    """
+    Parses generated token sequences to determine if they form valid mathematical equations.
+    """
+    valid_syntax = 0
+    mathematically_correct = 0
+    parsed_examples = []
+    
+    for seq in sequences:
+        text = dataset.decode(seq)
+        parsed_examples.append(text)
+        
+        # Must have exactly one equals sign
+        if text.count('=') != 1:
+            continue
+            
+        left_str, right_str = text.split('=')
+        
+        # Must not be empty on either side
+        if not left_str or not right_str:
+            continue
+            
+        try:
+            # Safely evaluate both sides of the generated equation
+            # (Restricted to standard python math via eval, which is safe given our tiny vocab)
+            left_val = eval(left_str)
+            right_val = eval(right_str)
+            
+            valid_syntax += 1
+            if left_val == right_val:
+                mathematically_correct += 1
+        except Exception:
+            # Catches syntax errors, division by zero, mismatched parentheses, etc.
+            pass
+            
+    total = len(sequences)
+    return {
+        "syntax_acc": valid_syntax / total,
+        "math_acc": mathematically_correct / total,
+        "examples": parsed_examples[:5] # Return first 5 for manual inspection
+    }
+
 if __name__ == "__main__":
     def main():
-        # 1. Configuration & Hyperparameters
+        random.seed(42)
+        torch.manual_seed(42)
+
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Executing on device: {device}")
 
+        # Config
         num_samples = 10000
         batch_size = 128
         seq_len = 16
-        mdlm_epochs = 16
+        mdlm_epochs = 5
         mlp_epochs = 3
         learning_rate = 5e-4
-        d_max = 10.0  # Assumed max L2 distance in the latent space
+        d_max = 10.0
+        generation_samples = 64 # Number of sequences to generate for evaluation
 
-        # 2. Shared Initialization
+        # Shared Initialization
         dataset = ArithmeticDataset(num_samples=num_samples, seq_len=seq_len)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 
@@ -570,59 +668,60 @@ if __name__ == "__main__":
         mask_id = dataset.mask_id
         num_timesteps = 50
 
-        # Helper to extract the ground truth parity (is_even) from the dataset strings
         def get_parity_labels(x_batch):
             labels = []
             for seq in x_batch:
                 eq_str = dataset.decode(seq)
                 try:
-                    # Extract the result after the '=' sign
                     ans = int(eq_str.split('=')[1])
                     labels.append(1.0 if ans % 2 == 0 else 0.0)
                 except:
-                    labels.append(0.0) # Fallback for any malformed sequences
+                    labels.append(0.0)
             return torch.tensor(labels, dtype=torch.float32, device=device)
 
-        # Extract a fixed test pair so both models interpolate the exact same equations
         test_batch = next(iter(dataloader)).to(device)
         fixed_x_a = test_batch[0:1]
         fixed_x_b = test_batch[1:2]
-
-        # Define the two experiment configurations
+        
         experiments = [
             {"name": "Baseline", "lambda_iso": 0.0, "prefix": "baseline"},
-            {"name": "Regularized", "lambda_iso": 1, "prefix": "regularized"}
+            {"name": "Regularized", "lambda_iso": 0.5, "prefix": "regularized"}
         ]
 
         results = {}
         os.makedirs("checkpoints", exist_ok=True)
 
-        # 3. Main Experiment Loop
         for exp in experiments:
             exp_name = exp["name"]
             l_iso = exp["lambda_iso"]
             prefix = exp["prefix"]
-
+            
             print(f"\n{'='*60}")
             print(f" EXPERIMENT: {exp_name} (lambda_iso = {l_iso})")
             print(f"{'='*60}")
 
-            # Initialize fresh models for this run
             model = MicroMDLM(vocab_size=vocab_size, num_timesteps=num_timesteps).to(device)
-            diffusion = MaskedDiffusionProcess(num_timesteps=num_timesteps, 
-                                               vocab_size=vocab_size, mask_token_id=mask_id)
+            diffusion = MaskedDiffusionProcess(num_timesteps=num_timesteps, vocab_size=vocab_size, mask_token_id=mask_id)
             value_model = ValueTwistMLP(d_model=128).to(device)
 
             optimizer_mdlm = torch.optim.AdamW(model.parameters(), lr=learning_rate)
             optimizer_mlp = torch.optim.AdamW(value_model.parameters(), lr=learning_rate)
 
+            # --- Pre-Training Inference (Untrained Check) ---
+            print(f"\n--- Pre-Training Inference: Generative Check ({exp_name}) ---")
+            untrained_seqs = generate_sequences(model, diffusion, generation_samples, seq_len, device)
+            untrained_metrics = evaluate_equation_validity(untrained_seqs, dataset)
+            print(f"Untrained Syntax Valid: {untrained_metrics['syntax_acc']*100:.1f}%")
+            print(f"Untrained Math Correct: {untrained_metrics['math_acc']*100:.1f}%")
+            print("Untrained Samples:", untrained_metrics['examples'][:3])
+
             # --- Phase 1: Train MicroMDLM ---
             print(f"\n--- Phase 1: Training {exp_name} MicroMDLM ---")
             model.train()
-
+            
             for epoch in range(mdlm_epochs):
                 pbar = tqdm(dataloader, desc=f"MDLM Epoch {epoch+1}/{mdlm_epochs}")
-
+                
                 for batch in pbar:
                     batch = batch.to(device)
                     optimizer_mdlm.zero_grad()
@@ -645,7 +744,6 @@ if __name__ == "__main__":
                         "Iso": f"{metrics['loss_iso']:.3f}"
                     })
 
-            # Freeze MDLM weights for Phase 2
             model.eval()
             for param in model.parameters():
                 param.requires_grad = False
@@ -657,70 +755,77 @@ if __name__ == "__main__":
 
             for epoch in range(mlp_epochs):
                 pbar = tqdm(dataloader, desc=f"MLP Epoch {epoch+1}/{mlp_epochs}")
-
+                
                 for batch in pbar:
                     batch = batch.to(device)
                     labels = get_parity_labels(batch)
-
+                    
                     optimizer_mlp.zero_grad()
 
                     with torch.no_grad():
                         _, z = model(batch, t_zero)
 
                     preds = value_model(z).squeeze(-1)
-
+                    
                     loss = F.binary_cross_entropy(preds, labels)
                     loss.backward()
                     optimizer_mlp.step()
 
                     pbar.set_postfix({"BCE Loss": f"{loss.item():.4f}"})
 
-            # --- Phase 3: Evaluation & Saving ---
+            # --- Phase 3: Evaluation & Generation ---
             print(f"\n--- Phase 3: Evaluating {exp_name} ---")
-
+            
             variance = measure_lipschitz_continuity(model, value_model, dataloader)
             print(f"Gradient Variance: {variance:.6f}")
 
             alphas = [0.0, 0.25, 0.5, 0.75, 1.0]
             interpolated_seqs = evaluate_latent_interpolation(model, fixed_x_a, fixed_x_b, alphas)
+            
+            print("Running Final Reverse Diffusion Inference...")
+            trained_seqs = generate_sequences(model, diffusion, generation_samples, seq_len, device)
+            trained_metrics = evaluate_equation_validity(trained_seqs, dataset)
 
-            # Store results for final comparison
             results[exp_name] = {
                 "variance": variance,
-                "interpolations": [dataset.decode(seq[0]) for seq in interpolated_seqs]
+                "interpolations": [dataset.decode(seq[0]) for seq in interpolated_seqs],
+                "gen_syntax": trained_metrics['syntax_acc'],
+                "gen_math": trained_metrics['math_acc'],
+                "gen_examples": trained_metrics['examples']
             }
 
-            # Save Models
             mdlm_path = os.path.join("checkpoints", f"mdlm_{prefix}.pt")
             mlp_path = os.path.join("checkpoints", f"value_mlp_{prefix}.pt")
             torch.save(model.state_dict(), mdlm_path)
             torch.save(value_model.state_dict(), mlp_path)
-            print(f"Saved {exp_name} models to checkpoints/")
 
         # 4. Final Comparative Output
         print("\n\n" + "="*60)
         print(" FINAL COMPARISON REPORT")
         print("="*60)
-
+        
         print("\n1. Lipschitz Continuity (Gradient Variance)")
         print("-" * 40)
         print(f"Baseline (λ=0.0):    {results['Baseline']['variance']:.6f}")
         print(f"Regularized (λ=0.5): {results['Regularized']['variance']:.6f}")
-        print("* Note: Lower variance indicates a smoother, more continuous latent manifold.\n")
 
-        print("2. Latent Interpolation Comparison")
+        print("\n2. Generative Quality (Reverse Diffusion)")
         print("-" * 40)
-        print(f"Sequence A (\\alpha=0.0): {dataset.decode(fixed_x_a[0])}")
-        print(f"Sequence B (\\alpha=1.0): {dataset.decode(fixed_x_b[0])}\n")
+        print(f"Baseline:    Valid Syntax = {results['Baseline']['gen_syntax']*100:.1f}% | Correct Math = {results['Baseline']['gen_math']*100:.1f}%")
+        print(f"Regularized: Valid Syntax = {results['Regularized']['gen_syntax']*100:.1f}% | Correct Math = {results['Regularized']['gen_math']*100:.1f}%")
+        
+        print("\nBaseline Generations:")
+        for eq in results['Baseline']['gen_examples']: print(f"  {eq}")
+        print("\nRegularized Generations:")
+        for eq in results['Regularized']['gen_examples']: print(f"  {eq}")
 
-        alphas = [0.0, 0.25, 0.5, 0.75, 1.0]
+        print("\n3. Latent Interpolation Comparison")
+        print("-" * 40)
         print(f"{'Alpha':<10} | {'Baseline Path':<20} | {'Regularized Path':<20}")
         print("-" * 55)
-        for i, alpha in enumerate(alphas):
+        for i, alpha in enumerate([0.0, 0.25, 0.5, 0.75, 1.0]):
             base_str = results['Baseline']['interpolations'][i]
             reg_str = results['Regularized']['interpolations'][i]
             print(f"{alpha:<10.2f} | {base_str:<20} | {reg_str:<20}")
-        print("\nExecution Complete.")
 
-    # Execute the script
     main()

@@ -14,7 +14,9 @@ from manifold_regularization import (
     compute_total_loss,
     evaluate_latent_interpolation,
     ValueTwistMLP,
-    measure_lipschitz_continuity
+    measure_lipschitz_continuity,
+    generate_sequences,
+    evaluate_equation_validity
 )
 
 # =============================================================================
@@ -36,7 +38,7 @@ def config():
         "batch_size": 4,
         "seq_len": 16,
         "vocab_size": 19,
-        "d_model": 32, # Scaled down for speed
+        "d_model": 128, # Scaled down for speed
         "n_layers": 2,
         "n_heads": 2,
         "num_timesteps": 50,
@@ -234,6 +236,97 @@ def test_compute_total_loss(model, diffusion, config, device):
     assert "loss_mdlm" in metrics
     assert "loss_iso" in metrics
     assert "total_loss" in metrics
+
+def test_generate_sequences(model, diffusion, config, device):
+    """
+    Tests that generate_sequences produces output of the correct shape,
+    that no [MASK] tokens remain in the final output, and that all token
+    IDs are within the valid vocabulary range.
+    """
+    num_samples = 8
+
+    generated = generate_sequences(
+        model, diffusion, num_samples, config["seq_len"], device, temperature=1.0
+    )
+
+    # Correct shape
+    assert generated.shape == (num_samples, config["seq_len"])
+
+    # No mask tokens should survive to the final output
+    assert not torch.any(generated == config["mask_id"]), \
+        "Found [MASK] tokens in final generated sequences"
+
+    # All token IDs must be within vocabulary bounds
+    assert torch.all(generated >= 0)
+    assert torch.all(generated < config["vocab_size"])
+
+
+def test_evaluate_equation_validity(tiny_dataset):
+    """
+    Tests evaluate_equation_validity against manually constructed cases:
+    a known-valid equation, a syntactically valid but mathematically wrong
+    equation, and a malformed string.
+    """
+    vocab_size = tiny_dataset.vocab_size
+    seq_len = tiny_dataset.seq_len
+    pad_id = tiny_dataset.pad_id
+
+    def encode(eq_str):
+        """Helper: encodes a string into a padded token tensor."""
+        ids = [tiny_dataset.char2id[c] for c in eq_str]
+        t = torch.full((seq_len,), pad_id, dtype=torch.long)
+        t[:len(ids)] = torch.tensor(ids, dtype=torch.long)
+        return t
+
+    # Case 1: mathematically correct
+    correct = encode("3+4=7")
+    # Case 2: valid syntax but wrong answer
+    wrong_math = encode("3+4=8")
+    # Case 3: malformed — no equals sign
+    malformed = encode("3+4+5")
+
+    batch = torch.stack([correct, wrong_math, malformed])
+    metrics = evaluate_equation_validity(batch, tiny_dataset)
+
+    # Two sequences have valid syntax (correct + wrong_math); one is malformed
+    assert metrics["syntax_acc"] == pytest.approx(2 / 3), \
+        f"Expected syntax_acc=0.667, got {metrics['syntax_acc']}"
+
+    # Only one is mathematically correct
+    assert metrics["math_acc"] == pytest.approx(1 / 3), \
+        f"Expected math_acc=0.333, got {metrics['math_acc']}"
+
+    # Examples list should contain at most 5 entries
+    assert len(metrics["examples"]) <= 5
+
+
+def test_q_sample_explicit_pad_id(diffusion, config, device):
+    """
+    Regression test for the pad_id fix: verifies that q_sample respects
+    an explicitly passed pad_id and never masks those positions, regardless
+    of the timestep.
+    """
+    pad_id = config["pad_id"]
+    batch_size, seq_len = config["batch_size"], config["seq_len"]
+
+    x_0 = torch.randint(2, config["vocab_size"], (batch_size, seq_len), device=device)
+    # Force the last 4 positions to be padding
+    x_0[:, -4:] = pad_id
+
+    # Use the maximum timestep to maximize masking pressure
+    t = torch.full((batch_size,), config["num_timesteps"] - 1, dtype=torch.long, device=device)
+
+    x_t = diffusion.q_sample(x_0, t, pad_id=pad_id)
+
+    pad_positions = x_0 == pad_id
+    assert torch.all(x_t[pad_positions] == pad_id), \
+        "Padding tokens were masked despite explicit pad_id protection"
+
+    # Also verify non-pad positions are not silently all preserved
+    # (with t at max, some masking should have occurred)
+    non_pad = ~pad_positions
+    assert torch.any(x_t[non_pad] == config["mask_id"]), \
+        "No tokens were masked at maximum timestep — forward process may be broken"
 
 # =============================================================================
 # Part 4: Evaluation Metrics Tests
