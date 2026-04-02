@@ -742,7 +742,7 @@ if __name__ == "__main__":
 
             ## TEST
             overfit_batch = next(iter(dataloader)).to(device)
-            
+
             print("\n--- Clean Overfit Test (no masking) ---")
             t_zero = torch.zeros(overfit_batch.size(0), dtype=torch.long, device=device)
             clean_optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
@@ -758,7 +758,7 @@ if __name__ == "__main__":
                     print(f"Clean overfit step {step}: {loss.item():.4f}")
 
             # Reinitialize model cleanly before masked training
-            model = MicroMDLM(vocab_size=vocab_size, num_timesteps=num_timesteps, d_model=d_model).to(device)
+            model = MicroMDLM(vocab_size=vocab_size, num_timesteps=num_timesteps, d_model=dim_model).to(device)
 
             print("\n--- Overfit Test (masking) ---")
 
