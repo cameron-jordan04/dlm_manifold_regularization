@@ -733,7 +733,7 @@ if __name__ == "__main__":
 
             ## TEST
             overfit_batch = next(iter(dataloader)).to(device)
-            for step in range(50):
+            for step in range(100):
                 x_a, x_b, d_edit = sample_sequence_pairs(overfit_batch, vocab_size, pad_id=pad_id)
                 loss, metrics = compute_total_loss(model, diffusion, x_a, x_b, d_edit, lambda_iso=0.0, pad_id=pad_id)
                 optimizer_mdlm.zero_grad()
@@ -742,10 +742,10 @@ if __name__ == "__main__":
                 if step % 10 == 0:
                     print(f"Overfit step {step}: {metrics['loss_mdlm']:.4f}")
             ## TEST
-            
+
             for epoch in range(mdlm_epochs):
                 pbar = tqdm(dataloader, desc=f"MDLM Epoch {epoch+1}/{mdlm_epochs}")
-                
+
                 for batch in pbar:
                     batch = batch.to(device)
                     optimizer_mdlm.zero_grad()
@@ -780,18 +780,18 @@ if __name__ == "__main__":
 
             for epoch in range(mlp_epochs):
                 pbar = tqdm(dataloader, desc=f"MLP Epoch {epoch+1}/{mlp_epochs}")
-                
+
                 for batch in pbar:
                     batch = batch.to(device)
                     labels = get_parity_labels(batch)
-                    
+
                     optimizer_mlp.zero_grad()
 
                     with torch.no_grad():
                         _, z = model(batch, t_zero)
 
                     preds = value_model(z).squeeze(-1)
-                    
+
                     loss = F.binary_cross_entropy(preds, labels)
                     loss.backward()
                     optimizer_mlp.step()
@@ -800,13 +800,13 @@ if __name__ == "__main__":
 
             # --- Phase 3: Evaluation & Generation ---
             print(f"\n--- Phase 3: Evaluating {exp_name} ---")
-            
+
             variance = measure_lipschitz_continuity(model, value_model, dataloader)
             print(f"Gradient Variance: {variance:.6f}")
 
             alphas = [0.0, 0.25, 0.5, 0.75, 1.0]
             interpolated_seqs = evaluate_latent_interpolation(model, fixed_x_a, fixed_x_b, alphas)
-            
+
             print("Running Final Reverse Diffusion Inference...")
             trained_seqs = generate_sequences(model, diffusion, generation_samples, seq_len, device)
             trained_metrics = evaluate_equation_validity(trained_seqs, dataset)
