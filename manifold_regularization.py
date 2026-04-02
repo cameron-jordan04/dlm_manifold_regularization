@@ -443,6 +443,13 @@ def compute_isometric_loss(z_t_a: torch.Tensor, z_t_b: torch.Tensor, d_edit: tor
 
     return penalty.mean()
 
+def get_timestep_range(epoch: int, total_epochs: int, num_timesteps: int):
+    """Curriculum: start with low noise, gradually increase to full range."""
+    progress = epoch / total_epochs  # 0.0 → 1.0
+    t_low = max(1, int(num_timesteps * 0.1))                          # always start from at least t=5
+    t_high = int(num_timesteps * (0.4 + 0.5 * progress))             # ramp from 40% → 90% of T
+    return t_low, t_high
+
 def compute_total_loss(
     model: 'MicroMDLM',
     diffusion: 'MaskedDiffusionProcess',
@@ -450,7 +457,9 @@ def compute_total_loss(
     x_b: torch.Tensor,
     d_edit: torch.Tensor,
     lambda_iso: float,
-    pad_id: int = 0
+    pad_id: int = 0,
+    t_low: int = 1,
+    t_high: int = 25
 ) -> Tuple[torch.Tensor, dict]:
     """
     Executes the full forward pass for a pair, computes both losses, and combines them.
@@ -460,7 +469,11 @@ def compute_total_loss(
 
     # 1. Sample random timesteps
     # CRITICAL: We use the same timestep t for both A and B to ensure valid manifold comparisons.
-    t = torch.randint(diffusion.num_timesteps // 2, diffusion.num_timesteps, (batch_size,), device=device)
+    if t_low is None:
+        t_low = 1
+    if t_high is None:
+        t_high = diffusion.num_timesteps
+    t = torch.randint(t_low, t_high, (batch_size,), device=device)
 
     # 2. Apply forward diffusion
     x_t_a = diffusion.q_sample(x_a, t, pad_id=pad_id)
@@ -743,23 +756,6 @@ if __name__ == "__main__":
             ## TEST
             overfit_batch = next(iter(dataloader)).to(device)
 
-            print("\n--- Clean Overfit Test (no masking) ---")
-            t_zero = torch.zeros(overfit_batch.size(0), dtype=torch.long, device=device)
-            clean_optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
-
-            for step in range(100):
-                clean_optimizer.zero_grad()
-                logits, _ = model(overfit_batch, t_zero)
-                non_pad_mask = overfit_batch != pad_id
-                loss = F.cross_entropy(logits[non_pad_mask], overfit_batch[non_pad_mask])
-                loss.backward()
-                clean_optimizer.step()
-                if step % 10 == 0:
-                    print(f"Clean overfit step {step}: {loss.item():.4f}")
-
-            # Reinitialize model cleanly before masked training
-            model = MicroMDLM(vocab_size=vocab_size, num_timesteps=num_timesteps, d_model=dim_model).to(device)
-
             print("\n--- Overfit Test (masking) ---")
 
             with torch.no_grad():
@@ -800,6 +796,7 @@ if __name__ == "__main__":
             )
 
             for epoch in range(mdlm_epochs):
+                t_low, t_high = get_timestep_range(epoch, mdlm_epochs, num_timesteps)
                 pbar = tqdm(dataloader, desc=f"MDLM Epoch {epoch+1}/{mdlm_epochs}")
 
                 for batch in pbar:
@@ -811,7 +808,7 @@ if __name__ == "__main__":
                     )
 
                     loss, metrics = compute_total_loss(
-                        model, diffusion, x_a, x_b, d_edit, l_iso, pad_id
+                        model, diffusion, x_a, x_b, d_edit, l_iso, pad_id, t_low, t_high
                     )
 
                     loss.backward()
