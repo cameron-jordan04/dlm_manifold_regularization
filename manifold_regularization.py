@@ -739,6 +739,9 @@ if __name__ == "__main__":
             print(f"\n--- Phase 1: Training {exp_name} MicroMDLM ---")
             model.train()
 
+            ## TEST
+            overfit_batch = next(iter(dataloader)).to(device)
+
             with torch.no_grad():
                 x_a, x_b, d_edit = sample_sequence_pairs(overfit_batch, vocab_size, pad_id=pad_id)
                 t_debug = torch.randint(diffusion.num_timesteps // 4, diffusion.num_timesteps, (x_a.size(0),), device=device)
@@ -755,10 +758,8 @@ if __name__ == "__main__":
                 print(f"Alpha_bar at t=49:        {diffusion.alpha_bar[49]:.4f}")
                 print(f"Example x_0:  {dataset.decode(x_a[0])}")
                 print(f"Example x_t:  {dataset.decode(x_t_a[0])}")
-
-            ## TEST
+            
             overfit_optimizer = torch.optim.AdamW(model.parameters(), lr=5e-3)
-            overfit_batch = next(iter(dataloader)).to(device)
             for step in range(200):
                 x_a, x_b, d_edit = sample_sequence_pairs(overfit_batch, vocab_size, pad_id=pad_id)
                 loss, metrics = compute_total_loss(model, diffusion, x_a, x_b, d_edit, lambda_iso=0.0, pad_id=pad_id)
