@@ -230,7 +230,12 @@ class MicroMDLM(nn.Module):
         super().__init__()
         # Token and Position Embeddings
         self.embedding = nn.Embedding(vocab_size, d_model)
-        self.positional_encoding = nn.Parameter(torch.randn(1, 16, d_model))
+        nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
+
+        self.positional_encoding = nn.Parameter(torch.randn(1, 16, d_model) * 0.02)
+
+        self.t_embedding = nn.Embedding(num_timesteps, d_model)
+        nn.init.normal_(self.t_embedding.weight, mean=0.0, std=0.02)
 
         # Timestep Embedding
         self.t_embedding = nn.Embedding(num_timesteps, d_model)
@@ -665,6 +670,7 @@ if __name__ == "__main__":
         mdlm_epochs = 16
         mlp_epochs = 4
         learning_rate = 2e-3
+        dim_model = 256
         generation_samples = 64 # Number of sequences to generate for evaluation
 
         # Shared Initialization
@@ -708,13 +714,13 @@ if __name__ == "__main__":
             print(f" EXPERIMENT: {exp_name} (lambda_iso = {l_iso})")
             print(f"{'='*60}")
 
-            model = MicroMDLM(vocab_size=vocab_size, num_timesteps=num_timesteps).to(device)
+            model = MicroMDLM(vocab_size=vocab_size, num_timesteps=num_timesteps, d_model=dim_model).to(device)
             diffusion = MaskedDiffusionProcess(num_timesteps=num_timesteps, vocab_size=vocab_size, mask_token_id=mask_id)
-            value_model = ValueTwistMLP(d_model=128).to(device)
+            value_model = ValueTwistMLP(d_model=dim_model).to(device)
 
             optimizer_mdlm = torch.optim.AdamW(model.parameters(), lr=learning_rate)
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer_mdlm, T_max=mdlm_epochs * len(dataloader)
+                optimizer_mdlm, T_max=mdlm_epochs * len(dataloader), eta_min=1e-5
             )
 
             optimizer_mlp = torch.optim.AdamW(value_model.parameters(), lr=learning_rate)
@@ -732,16 +738,23 @@ if __name__ == "__main__":
             model.train()
 
             ## TEST
+            overfit_optimizer = torch.optim.AdamW(model.parameters(), lr=2e-3)
             overfit_batch = next(iter(dataloader)).to(device)
             for step in range(100):
                 x_a, x_b, d_edit = sample_sequence_pairs(overfit_batch, vocab_size, pad_id=pad_id)
                 loss, metrics = compute_total_loss(model, diffusion, x_a, x_b, d_edit, lambda_iso=0.0, pad_id=pad_id)
-                optimizer_mdlm.zero_grad()
+                overfit_optimizer.zero_grad()
                 loss.backward()
-                optimizer_mdlm.step()
+                overfit_optimizer.step()
                 if step % 10 == 0:
                     print(f"Overfit step {step}: {metrics['loss_mdlm']:.4f}")
             ## TEST
+
+            # Re-initialize production optimizer and scheduler with clean state
+            optimizer_mdlm = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer_mdlm, T_max=mdlm_epochs * len(dataloader), eta_min=1e-5
+            )
 
             for epoch in range(mdlm_epochs):
                 pbar = tqdm(dataloader, desc=f"MDLM Epoch {epoch+1}/{mdlm_epochs}")
