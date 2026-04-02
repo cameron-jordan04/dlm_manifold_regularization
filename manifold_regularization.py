@@ -437,7 +437,7 @@ def compute_total_loss(
 
     # 1. Sample random timesteps
     # CRITICAL: We use the same timestep t for both A and B to ensure valid manifold comparisons.
-    t = torch.randint(0, diffusion.num_timesteps, (batch_size,), device=device)
+    t = torch.randint(diffusion.num_timesteps // 4, diffusion.num_timesteps, (batch_size,), device=device)
 
     # 2. Apply forward diffusion
     x_t_a = diffusion.q_sample(x_a, t, pad_id=pad_id)
