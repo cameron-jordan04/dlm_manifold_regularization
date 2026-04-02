@@ -720,6 +720,18 @@ if __name__ == "__main__":
             # --- Phase 1: Train MicroMDLM ---
             print(f"\n--- Phase 1: Training {exp_name} MicroMDLM ---")
             model.train()
+
+            ## TEST
+            overfit_batch = next(iter(dataloader)).to(device)
+            for step in range(50):
+                x_a, x_b, d_edit = sample_sequence_pairs(overfit_batch, vocab_size, pad_id=pad_id)
+                loss, metrics = compute_total_loss(model, diffusion, x_a, x_b, d_edit, lambda_iso=0.0, pad_id=pad_id)
+                loss.backward()
+                optimizer_mdlm.step()
+                optimizer_mdlm.zero_grad()
+                if step % 10 == 0:
+                    print(f"Overfit step {step}: {metrics['loss_mdlm']:.4f}")
+            ## TEST
             
             for epoch in range(mdlm_epochs):
                 pbar = tqdm(dataloader, desc=f"MDLM Epoch {epoch+1}/{mdlm_epochs}")
