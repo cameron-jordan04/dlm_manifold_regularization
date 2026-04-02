@@ -649,13 +649,12 @@ if __name__ == "__main__":
         print(f"Executing on device: {device}")
 
         # Config
-        num_samples = 10000
+        num_samples = 100000
         batch_size = 128
         seq_len = 16
-        mdlm_epochs = 5
-        mlp_epochs = 3
+        mdlm_epochs = 16
+        mlp_epochs = 4
         learning_rate = 5e-4
-        d_max = 10.0
         generation_samples = 64 # Number of sequences to generate for evaluation
 
         # Shared Initialization
