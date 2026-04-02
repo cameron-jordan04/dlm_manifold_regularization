@@ -283,3 +283,16 @@ def test_measure_lipschitz_continuity(model, config, device):
 
     assert isinstance(variance, float)
     assert variance >= 0.0 # Variance cannot be negative
+
+# =============================================================================
+# Execution Block
+# =============================================================================
+
+if __name__ == "__main__":
+    import sys
+    
+    # Run pytest on the current file with verbose output
+    exit_code = pytest.main(["-v", __file__])
+    
+    # Exit with the code returned by pytest
+    sys.exit(exit_code)
