@@ -298,10 +298,11 @@ class MaskedDiffusionProcess:
         self.mask_token_id = mask_token_id
 
         self.register_buffer = None
-        beta = torch.linspace(1e-4, 0.05, num_timesteps)
-        alpha = 1.0 - beta
-        self.alpha_bar = torch.cumprod(alpha, dim=0)
-        self.alpha_single = alpha
+        steps = torch.arange(num_timesteps + 1, dtype=torch.float32)
+        f = torch.cos(((steps / num_timesteps) + 0.008) / 1.008 * torch.pi / 2) ** 2
+        alpha_bar_full = f / f[0]
+        self.alpha_single = (alpha_bar_full[1:] / alpha_bar_full[:-1]).clamp(min=1e-8)
+        self.alpha_bar = alpha_bar_full[1:]
 
     def q_sample(self, x_0: torch.Tensor, t: torch.Tensor, pad_id: int = 0) -> torch.Tensor:
         """
@@ -459,7 +460,7 @@ def compute_total_loss(
 
     # 1. Sample random timesteps
     # CRITICAL: We use the same timestep t for both A and B to ensure valid manifold comparisons.
-    t = torch.randint(diffusion.num_timesteps // 4, diffusion.num_timesteps, (batch_size,), device=device)
+    t = torch.randint(diffusion.num_timesteps // 2, diffusion.num_timesteps, (batch_size,), device=device)
 
     # 2. Apply forward diffusion
     x_t_a = diffusion.q_sample(x_a, t, pad_id=pad_id)
@@ -740,11 +741,29 @@ if __name__ == "__main__":
             model.train()
 
             ## TEST
+            print("\n--- Clean Overfit Test (no masking) ---")
+            t_zero = torch.zeros(overfit_batch.size(0), dtype=torch.long, device=device)
+            clean_optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+
+            for step in range(100):
+                clean_optimizer.zero_grad()
+                logits, _ = model(overfit_batch, t_zero)
+                non_pad_mask = overfit_batch != pad_id
+                loss = F.cross_entropy(logits[non_pad_mask], overfit_batch[non_pad_mask])
+                loss.backward()
+                clean_optimizer.step()
+                if step % 10 == 0:
+                    print(f"Clean overfit step {step}: {loss.item():.4f}")
+
+            # Reinitialize model cleanly before masked training
+            model = MicroMDLM(vocab_size=vocab_size, num_timesteps=num_timesteps, d_model=d_model).to(device)
+
+            print("\n--- Overfit Test (masking) ---")
             overfit_batch = next(iter(dataloader)).to(device)
 
             with torch.no_grad():
                 x_a, x_b, d_edit = sample_sequence_pairs(overfit_batch, vocab_size, pad_id=pad_id)
-                t_debug = torch.randint(diffusion.num_timesteps // 4, diffusion.num_timesteps, (x_a.size(0),), device=device)
+                t_debug = torch.randint(diffusion.num_timesteps // 2, diffusion.num_timesteps, (x_a.size(0),), device=device)
                 x_t_a = diffusion.q_sample(x_a, t_debug, pad_id=pad_id)
                 
                 mask_a = (x_t_a == mask_id) & (x_a != pad_id)
