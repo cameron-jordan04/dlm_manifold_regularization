@@ -21,7 +21,7 @@ from tqdm import tqdm
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, TensorDataset
 
 # =============================================================================
 # Part 1: A Dataset of Synthetic Structured Language
@@ -688,31 +688,33 @@ if __name__ == "__main__":
         num_samples = 100000
         batch_size = 128
         seq_len = 16
-        mdlm_epochs = 16
-        mlp_epochs = 4
-        learning_rate = 2e-3
+        mdlm_epochs = 24
+        mlp_epochs = 2
+        learning_rate = 5e-3
         dim_model = 256
         generation_samples = 64 # Number of sequences to generate for evaluation
 
         # Shared Initialization
         dataset = ArithmeticDataset(num_samples=num_samples, seq_len=seq_len)
+
+        print("Precomputing parity labels...")
+        parity_labels = torch.zeros(num_samples, dtype=torch.float32)
+        for i in range(num_samples):
+            eq_str = dataset.decode(dataset[i])
+            try:
+                ans = int(eq_str.split('=')[1])
+                parity_labels[i] = 1.0 if ans % 2 == 0 else 0.0
+            except:
+                parity_labels[i] = 0.0
+        parity_labels = parity_labels.to(device)
+        print("Parity labels precomputed.")
+
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 
         vocab_size = dataset.vocab_size
         pad_id = dataset.pad_id
         mask_id = dataset.mask_id
         num_timesteps = 50
-
-        def get_parity_labels(x_batch):
-            labels = []
-            for seq in x_batch:
-                eq_str = dataset.decode(seq)
-                try:
-                    ans = int(eq_str.split('=')[1])
-                    labels.append(1.0 if ans % 2 == 0 else 0.0)
-                except:
-                    labels.append(0.0)
-            return torch.tensor(labels, dtype=torch.float32, device=device)
 
         test_batch = next(iter(dataloader)).to(device)
         fixed_x_a = test_batch[0:1]
@@ -751,40 +753,6 @@ if __name__ == "__main__":
 
             # --- Phase 1: Train MicroMDLM ---
             print(f"\n--- Phase 1: Training {exp_name} MicroMDLM ---")
-            model.train()
-
-            ## TEST
-            overfit_batch = next(iter(dataloader)).to(device)
-
-            print("\n--- Overfit Test (masking) ---")
-
-            with torch.no_grad():
-                x_a, x_b, d_edit = sample_sequence_pairs(overfit_batch, vocab_size, pad_id=pad_id)
-                t_debug = torch.randint(diffusion.num_timesteps // 2, diffusion.num_timesteps, (x_a.size(0),), device=device)
-                x_t_a = diffusion.q_sample(x_a, t_debug, pad_id=pad_id)
-                
-                mask_a = (x_t_a == mask_id) & (x_a != pad_id)
-                non_pad = (x_a != pad_id)
-                
-                print(f"Avg tokens per sequence:  {non_pad.float().sum(dim=1).mean():.1f}")
-                print(f"Avg masked per sequence:  {mask_a.float().sum(dim=1).mean():.1f}")
-                print(f"Mask density:             {mask_a.float().mean():.3f}")
-                print(f"Timestep range:           [{t_debug.min().item()}, {t_debug.max().item()}]")
-                print(f"Alpha_bar at t=12:        {diffusion.alpha_bar[12]:.4f}")
-                print(f"Alpha_bar at t=49:        {diffusion.alpha_bar[49]:.4f}")
-                print(f"Example x_0:  {dataset.decode(x_a[0])}")
-                print(f"Example x_t:  {dataset.decode(x_t_a[0])}")
-            
-            overfit_optimizer = torch.optim.AdamW(model.parameters(), lr=5e-3)
-            for step in range(200):
-                x_a, x_b, d_edit = sample_sequence_pairs(overfit_batch, vocab_size, pad_id=pad_id)
-                loss, metrics = compute_total_loss(model, diffusion, x_a, x_b, d_edit, lambda_iso=0.0, pad_id=pad_id)
-                overfit_optimizer.zero_grad()
-                loss.backward()
-                overfit_optimizer.step()
-                if step % 20 == 0:
-                    print(f"Overfit step {step}: {metrics['loss_mdlm']:.4f}")
-            ## TEST
 
             model = MicroMDLM(vocab_size=vocab_size, num_timesteps=num_timesteps, d_model=dim_model).to(device)
             model.train()
@@ -831,21 +799,25 @@ if __name__ == "__main__":
             value_model.train()
             t_zero = torch.zeros(batch_size, dtype=torch.long, device=device)
 
-            for epoch in range(mlp_epochs):
-                pbar = tqdm(dataloader, desc=f"MLP Epoch {epoch+1}/{mlp_epochs}")
+            labeled_dataset = TensorDataset(dataset.data, parity_labels.cpu())
+            labeled_dataloader = DataLoader(
+                labeled_dataset, batch_size=batch_size, shuffle=True, drop_last=True
+            )
 
-                for batch in pbar:
-                    batch = batch.to(device)
-                    labels = get_parity_labels(batch)
+            for epoch in range(mlp_epochs):
+                pbar = tqdm(labeled_dataloader, desc=f"MLP Epoch {epoch+1}/{mlp_epochs}")
+
+                for batch_seq, batch_labels in pbar:
+                    batch_seq = batch_seq.to(device)
+                    batch_labels = batch_labels.to(device)
 
                     optimizer_mlp.zero_grad()
 
                     with torch.no_grad():
-                        _, z = model(batch, t_zero)
+                        _, z = model(batch_seq, t_zero)
 
                     preds = value_model(z).squeeze(-1)
-
-                    loss = F.binary_cross_entropy(preds, labels)
+                    loss = F.binary_cross_entropy(preds, batch_labels)
                     loss.backward()
                     optimizer_mlp.step()
 
@@ -893,9 +865,12 @@ if __name__ == "__main__":
         print(f"Regularized: Valid Syntax = {results['Regularized']['gen_syntax']*100:.1f}% | Correct Math = {results['Regularized']['gen_math']*100:.1f}%")
 
         print("\nBaseline Generations:")
-        for eq in results['Baseline']['gen_examples']: print(f"  {eq}")
+        for eq in results['Baseline']['gen_examples']:
+            print(f"  {eq}")
+
         print("\nRegularized Generations:")
-        for eq in results['Regularized']['gen_examples']: print(f"  {eq}")
+        for eq in results['Regularized']['gen_examples']:
+            print(f"  {eq}")
 
         print("\n3. Latent Interpolation Comparison")
         print("-" * 40)
