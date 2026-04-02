@@ -427,7 +427,6 @@ def compute_total_loss(
     x_b: torch.Tensor,
     d_edit: torch.Tensor,
     lambda_iso: float,
-    d_max: float,
     pad_id: int = 0
 ) -> Tuple[torch.Tensor, dict]:
     """
@@ -731,7 +730,7 @@ if __name__ == "__main__":
                     )
 
                     loss, metrics = compute_total_loss(
-                        model, diffusion, x_a, x_b, d_edit, l_iso, d_max, pad_id
+                        model, diffusion, x_a, x_b, d_edit, l_iso, pad_id
                     )
 
                     loss.backward()
@@ -803,7 +802,7 @@ if __name__ == "__main__":
         print("\n\n" + "="*60)
         print(" FINAL COMPARISON REPORT")
         print("="*60)
-        
+
         print("\n1. Lipschitz Continuity (Gradient Variance)")
         print("-" * 40)
         print(f"Baseline (λ=0.0):    {results['Baseline']['variance']:.6f}")
@@ -813,7 +812,7 @@ if __name__ == "__main__":
         print("-" * 40)
         print(f"Baseline:    Valid Syntax = {results['Baseline']['gen_syntax']*100:.1f}% | Correct Math = {results['Baseline']['gen_math']*100:.1f}%")
         print(f"Regularized: Valid Syntax = {results['Regularized']['gen_syntax']*100:.1f}% | Correct Math = {results['Regularized']['gen_math']*100:.1f}%")
-        
+
         print("\nBaseline Generations:")
         for eq in results['Baseline']['gen_examples']: print(f"  {eq}")
         print("\nRegularized Generations:")

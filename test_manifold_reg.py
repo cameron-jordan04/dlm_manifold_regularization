@@ -208,13 +208,13 @@ def test_compute_isometric_loss():
 
     # Test identical latents (distance should be 0)
     d_edit = torch.zeros(batch_size)
-    loss_identical = compute_isometric_loss(z_a, z_a, d_edit, d_max=10.0)
+    loss_identical = compute_isometric_loss(z_a, z_a, d_edit)
     assert torch.isclose(loss_identical, torch.tensor(0.0))
 
     # Test separate latents
     z_b = torch.randn(batch_size, seq_len, d_model, requires_grad=True)
     d_edit_random = torch.rand(batch_size)
-    loss_diff = compute_isometric_loss(z_a, z_b, d_edit_random, d_max=10.0)
+    loss_diff = compute_isometric_loss(z_a, z_b, d_edit_random)
     assert loss_diff.item() > 0.0
     assert loss_diff.requires_grad
 
@@ -229,7 +229,7 @@ def test_compute_total_loss(model, diffusion, config, device):
     d_edit = torch.rand(config["batch_size"]).to(device)
 
     loss, metrics = compute_total_loss(
-        model, diffusion, x_a, x_b, d_edit, lambda_iso=0.1, d_max=10.0, pad_id=config["pad_id"]
+        model, diffusion, x_a, x_b, d_edit, lambda_iso=0.1, pad_id=config["pad_id"]
     )
 
     assert loss.requires_grad
