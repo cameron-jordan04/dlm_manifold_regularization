@@ -726,9 +726,9 @@ if __name__ == "__main__":
             for step in range(50):
                 x_a, x_b, d_edit = sample_sequence_pairs(overfit_batch, vocab_size, pad_id=pad_id)
                 loss, metrics = compute_total_loss(model, diffusion, x_a, x_b, d_edit, lambda_iso=0.0, pad_id=pad_id)
+                optimizer_mdlm.zero_grad()
                 loss.backward()
                 optimizer_mdlm.step()
-                optimizer_mdlm.zero_grad()
                 if step % 10 == 0:
                     print(f"Overfit step {step}: {metrics['loss_mdlm']:.4f}")
             ## TEST
