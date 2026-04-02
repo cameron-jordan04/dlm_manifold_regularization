@@ -739,6 +739,23 @@ if __name__ == "__main__":
             print(f"\n--- Phase 1: Training {exp_name} MicroMDLM ---")
             model.train()
 
+            with torch.no_grad():
+                x_a, x_b, d_edit = sample_sequence_pairs(overfit_batch, vocab_size, pad_id=pad_id)
+                t_debug = torch.randint(diffusion.num_timesteps // 4, diffusion.num_timesteps, (x_a.size(0),), device=device)
+                x_t_a = diffusion.q_sample(x_a, t_debug, pad_id=pad_id)
+                
+                mask_a = (x_t_a == mask_id) & (x_a != pad_id)
+                non_pad = (x_a != pad_id)
+                
+                print(f"Avg tokens per sequence:  {non_pad.float().sum(dim=1).mean():.1f}")
+                print(f"Avg masked per sequence:  {mask_a.float().sum(dim=1).mean():.1f}")
+                print(f"Mask density:             {mask_a.float().mean():.3f}")
+                print(f"Timestep range:           [{t_debug.min().item()}, {t_debug.max().item()}]")
+                print(f"Alpha_bar at t=12:        {diffusion.alpha_bar[12]:.4f}")
+                print(f"Alpha_bar at t=49:        {diffusion.alpha_bar[49]:.4f}")
+                print(f"Example x_0:  {dataset.decode(x_a[0])}")
+                print(f"Example x_t:  {dataset.decode(x_t_a[0])}")
+
             ## TEST
             overfit_optimizer = torch.optim.AdamW(model.parameters(), lr=5e-3)
             overfit_batch = next(iter(dataloader)).to(device)
