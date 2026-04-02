@@ -183,7 +183,8 @@ def test_compute_mdlm_loss():
     Test compute_mdlm_loss
     """
     vocab_size = 19
-    logits = torch.randn(4, 16, vocab_size)
+    # ADDED requires_grad=True here
+    logits = torch.randn(4, 16, vocab_size, requires_grad=True) 
     targets = torch.randint(0, vocab_size, (4, 16))
     mask = torch.rand(4, 16) > 0.5 # Random boolean mask
 
