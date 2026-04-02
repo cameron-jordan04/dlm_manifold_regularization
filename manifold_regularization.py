@@ -221,8 +221,12 @@ class MicroMDLM(nn.Module):
     """
     A minimal Transformer encoder for Masked Diffusion.
     """
-    def __init__(self, vocab_size: int, num_timesteps: int, d_model: int = 128,
-                 n_layers: int = 4, n_heads: int = 4):
+    def __init__(self,
+                 vocab_size: int,
+                 num_timesteps: int,
+                 d_model: int = 256,
+                 n_layers: int = 6,
+                 n_heads: int = 4):
         super().__init__()
         # Token and Position Embeddings
         self.embedding = nn.Embedding(vocab_size, d_model)
@@ -232,7 +236,13 @@ class MicroMDLM(nn.Module):
         self.t_embedding = nn.Embedding(num_timesteps, d_model)
 
         # Transformer Backbone
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_heads, batch_first=True)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            batch_first=True,
+            norm_first=True,
+            dim_feedforward=512
+        )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
         # Unembedding projection to vocabulary logits
