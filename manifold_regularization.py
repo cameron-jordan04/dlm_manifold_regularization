@@ -236,6 +236,8 @@ class MicroMDLM(nn.Module):
 
         self.t_embedding = nn.Embedding(num_timesteps, d_model)
         nn.init.normal_(self.t_embedding.weight, mean=0.0, std=0.02)
+        self.t_scale = nn.Linear(d_model, d_model)
+        self.t_shift = nn.Linear(d_model, d_model)
 
         # Timestep Embedding
         self.t_embedding = nn.Embedding(num_timesteps, d_model)
@@ -251,7 +253,8 @@ class MicroMDLM(nn.Module):
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
         # Unembedding projection to vocabulary logits
-        self.unembedding = nn.Linear(d_model, vocab_size)
+        self.unembedding = nn.Linear(d_model, vocab_size, bias=False)
+        self.unembedding.weight = self.embedding.weight   # tie weights
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -270,10 +273,14 @@ class MicroMDLM(nn.Module):
         t_emb = self.t_embedding(t)
 
         # 3. Inject timestep embeddings by broadcasting across the sequence length, shape: [B, L, D]
-        emb = emb + t_emb.unsqueeze(1)
+        scale = self.t_scale(t_emb).unsqueeze(1)   # [B, 1, D]
+        shift = self.t_shift(t_emb).unsqueeze(1)   # [B, 1, D]
+        emb = emb * (1.0 + scale) + shift
+
+        pad_mask = (x == 0)   # [B, L], True where padding
 
         # 4. Process through Transformer to extract continuous latents z_t, shape: [B, L, D]
-        latents = self.transformer(emb)
+        latents = self.transformer(emb, src_key_padding_mask=pad_mask)
 
         # 5. Project to discrete vocabulary space, shape: [B, L, V]
         logits = self.unembedding(latents)
@@ -749,6 +756,8 @@ if __name__ == "__main__":
                 if step % 10 == 0:
                     print(f"Overfit step {step}: {metrics['loss_mdlm']:.4f}")
             ## TEST
+
+            model = MicroMDLM(vocab_size=vocab_size, num_timesteps=num_timesteps, d_model=dim_model).to(device)
 
             # Re-initialize production optimizer and scheduler with clean state
             optimizer_mdlm = torch.optim.AdamW(model.parameters(), lr=learning_rate)
